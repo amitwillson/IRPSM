@@ -69,23 +69,53 @@ python recon_dashboard.py
 Lists every link on the post-login dashboard. Find the one for "Works" (or
 whatever it's labeled) and set `IRPSM_WORKS_URL` in `.env` to its full URL.
 
-## Step 4: Scrape
+## Step 4: Filtering to PH 53
+
+Only "PH 53" works are wanted, not the full listing. Run:
+
+```bash
+python recon_works.py
+```
+
+This opens the works page and dumps every dropdown/text input/button
+(`recon_output/works_controls.json` + a screenshot) — look for a
+Phase-related `<select>` and check its `options` list for an entry like
+`PH 53` or `Phase 53`. Then set in `.env`:
+
+- `IRPSM_FILTER_SELECTOR` — CSS selector for that control
+- `IRPSM_FILTER_TYPE` — `select` (dropdown) or `text` (free-text box)
+- `IRPSM_FILTER_VALUE` — the exact option text/value, e.g. `PH 53`
+- `IRPSM_FILTER_SUBMIT_SELECTOR` — only if a separate "Search"/"Go" button
+  applies the filter (leave blank if selecting the dropdown reloads
+  automatically)
+
+If you can't find a working filter control, that's fine — leave
+`IRPSM_FILTER_SELECTOR` blank. `scrape_works.py` always applies a
+**client-side safety net** afterwards: any scraped row that doesn't
+contain `IRPSM_ROW_FILTER_TEXT` (defaults to `PH 53`) in any column is
+dropped before writing the CSV. This means the final output is always
+PH 53-only even if the site-side filter isn't wired up, at the cost of
+still crawling the full listing first.
+
+## Step 5: Scrape
 
 ```bash
 python scrape_works.py
 ```
 
-Visits the works URL, extracts every `<table>` row, follows "Next" page
-links automatically, and writes everything to `output/works.csv`.
+Visits the works URL, applies the PH 53 filter (if configured), extracts
+every `<table>` row, follows "Next" page links automatically, drops any
+row that doesn't mention "PH 53" (the safety net above), and writes the
+result to `output/works.csv`.
 
 If the works list isn't a plain HTML `<table>` (e.g. it's a JS grid built
-from `<div>`s), open `recon_output/dashboard.png`, look at the real page
+from `<div>`s), open `recon_output/works_page.png`, look at the real page
 structure in your browser's dev tools, and set `IRPSM_TABLE_SELECTOR` /
-`IRPSM_NEXT_PAGE_SELECTOR` in `.env` to match. This is the one part most
+`IRPSM_NEXT_PAGE_SELECTOR` in `.env` to match. This is the part most
 likely to need a small tweak, since the site's markup can't be inspected
 in advance.
 
-## Step 5: Google Sheets setup
+## Step 6: Google Sheets setup
 
 1. Go to https://console.cloud.google.com/, create (or pick) a project.
 2. Enable the **Google Sheets API** and **Google Drive API**.

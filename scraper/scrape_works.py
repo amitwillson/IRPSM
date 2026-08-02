@@ -9,6 +9,17 @@ something other than a plain <table> (e.g. a div-based grid), inspect
 recon_output/dashboard.png / works_page.png and adjust TABLE_SELECTOR /
 ROW_SELECTOR below.
 
+Only "PH 53" works are wanted. Two ways this is applied, use whichever
+fits what the site actually offers (run recon_works.py to find out):
+
+1. Site-side filter (preferred, faster): if the works page has a
+   dropdown/search box for phase, set IRPSM_FILTER_SELECTOR (+
+   IRPSM_FILTER_TYPE = select|text, + IRPSM_FILTER_SUBMIT_SELECTOR if a
+   separate button applies it) and IRPSM_FILTER_VALUE=PH 53 in .env.
+2. Client-side fallback (always on unless disabled): after scraping,
+   any row that doesn't contain IRPSM_ROW_FILTER_TEXT (default "PH 53")
+   in any column is dropped. Set IRPSM_ROW_FILTER_TEXT="" to disable.
+
 Usage:
     python scrape_works.py
 """
@@ -33,6 +44,27 @@ NEXT_PAGE_SELECTOR = os.environ.get(
     "a:has-text('Next'), a:has-text('>'), .pagination a[rel='next']",
 )
 MAX_PAGES = int(os.environ.get("IRPSM_MAX_PAGES", "500"))
+
+FILTER_SELECTOR = os.environ.get("IRPSM_FILTER_SELECTOR")
+FILTER_TYPE = os.environ.get("IRPSM_FILTER_TYPE", "select")  # "select" or "text"
+FILTER_VALUE = os.environ.get("IRPSM_FILTER_VALUE", "PH 53")
+FILTER_SUBMIT_SELECTOR = os.environ.get("IRPSM_FILTER_SUBMIT_SELECTOR")
+ROW_FILTER_TEXT = os.environ.get("IRPSM_ROW_FILTER_TEXT", "PH 53")
+
+
+def apply_filter(page):
+    if not FILTER_SELECTOR:
+        return
+    if FILTER_TYPE == "select":
+        try:
+            page.select_option(FILTER_SELECTOR, label=FILTER_VALUE)
+        except Exception:
+            page.select_option(FILTER_SELECTOR, FILTER_VALUE)
+    else:
+        page.fill(FILTER_SELECTOR, FILTER_VALUE)
+    if FILTER_SUBMIT_SELECTOR:
+        page.click(FILTER_SUBMIT_SELECTOR)
+    page.wait_for_load_state("networkidle")
 
 
 def extract_table(page):
@@ -71,6 +103,7 @@ def main():
         context = browser.new_context(storage_state=STORAGE_STATE_PATH)
         page = context.new_page()
         page.goto(WORKS_URL, wait_until="networkidle")
+        apply_filter(page)
 
         for page_num in range(1, MAX_PAGES + 1):
             page.wait_for_timeout(500)
@@ -87,6 +120,14 @@ def main():
             time.sleep(0.5)
 
         browser.close()
+
+    if ROW_FILTER_TEXT:
+        before = len(all_rows)
+        all_rows = [
+            row for row in all_rows
+            if any(ROW_FILTER_TEXT.lower() in cell.lower() for cell in row)
+        ]
+        print(f"Row filter '{ROW_FILTER_TEXT}': kept {len(all_rows)} of {before} rows")
 
     out_path = OUT_DIR / "works.csv"
     with open(out_path, "w", newline="", encoding="utf-8") as f:
