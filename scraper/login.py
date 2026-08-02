@@ -53,9 +53,13 @@ def login_and_save_session(headless=False):
         if OTP_SELECTOR:
             print("\nAn OTP should have been sent to you. Check your phone/email.")
             otp = input("Enter the OTP: ").strip()
-            page.fill(OTP_SELECTOR, otp)
+            # type() simulates real keystrokes (fill() doesn't fire key
+            # events), which some OTP fields need for their JS validation.
+            page.type(OTP_SELECTOR, otp, delay=50)
             if OTP_SUBMIT_SELECTOR:
                 page.click(OTP_SUBMIT_SELECTOR)
+            else:
+                page.press(OTP_SELECTOR, "Enter")
             page.wait_for_load_state("networkidle")
         else:
             print("\nNo OTP selector configured — if the site is now showing an OTP")
