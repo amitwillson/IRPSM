@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 
@@ -249,15 +250,28 @@ def fetch_full_activity(
     return deduped
 
 
-def build_round_ledger(activity: list[dict]) -> list[dict]:
+_FIVE_MIN_TITLE_RE = re.compile(r"\bUp or Down\b.*\d{1,2}:\d{2}\s*(AM|PM)\s*-\s*\d{1,2}:\d{2}\s*(AM|PM)", re.I)
+
+
+def build_round_ledger(activity: list[dict], open_condition_ids: set[str] | None = None) -> list[dict]:
     """Collapse a raw activity ledger into one row per market ("round") traded.
 
-    Groups TRADE/REDEEM/MERGE events by conditionId and produces, per market:
-    entry side(s), avg entry price, total cost basis, number of fills, redeem
-    payout, realized P&L, win/loss, first-trade and last-event timestamps.
-    This is the shape you want for strategy backtesting/decoding — one row
-    per decision the wallet made, in chronological order.
+    Realized P&L per market is computed as a full cash-flow net: BUY costs
+    and SPLIT costs are cash out; SELL proceeds, REDEEM payouts and MERGE
+    payouts are cash in. This is the only way to get a correct number for
+    wallets that exit positions by selling before resolution, or that hold
+    both outcome tokens of the same market (common in these markets — the
+    losing side simply expires worthless with no on-chain event, so relying
+    on the presence of a REDEEM event alone undercounts wins and misreports
+    open/exited positions as losses).
+
+    A round is only marked WIN/LOSS once we know it's actually closed: either
+    a REDEEM/MERGE event was seen, or (if `open_condition_ids` — the wallet's
+    *currently* open positions, from /positions — is supplied) the market is
+    absent from that set. Anything still genuinely open is left as `None`
+    (OPEN) rather than being counted as a loss.
     """
+    open_condition_ids = open_condition_ids or set()
     by_market: dict[str, dict] = {}
 
     for evt in sorted(activity, key=lambda e: int(e.get("timestamp") or 0)):
@@ -269,52 +283,71 @@ def build_round_ledger(activity: list[dict]) -> list[dict]:
             {
                 "conditionId": cid,
                 "title": evt.get("title"),
-                "outcome": None,
                 "first_trade_ts": None,
                 "last_event_ts": None,
                 "trade_count": 0,
-                "cost_basis": 0.0,
-                "shares_bought": 0.0,
-                "redeem_payout": 0.0,
-                "realized": False,
-            }
+                "net_cash": 0.0,  # negative = spent, positive = received
+                "shares_by_asset": {},  # asset -> net remaining shares (signed; used to detect a flat/closed position)
+                "assets_entered": set(),  # asset -> ever bought here (used to report which side was taken)
+                "saw_redeem_or_merge": False,
+            },
         )
         bucket["title"] = bucket["title"] or evt.get("title")
         ts = int(evt.get("timestamp") or 0)
         bucket["last_event_ts"] = ts
-        if bucket["first_trade_ts"] is None and evt.get("type") == "TRADE":
-            bucket["first_trade_ts"] = ts
-            bucket["outcome"] = evt.get("outcome")
 
-        if evt.get("type") == "TRADE" and evt.get("side") == "BUY":
-            price = float(evt.get("price") or 0)
-            size = float(evt.get("size") or 0)
-            bucket["cost_basis"] += price * size
-            bucket["shares_bought"] += size
+        etype = evt.get("type")
+        asset = evt.get("asset")
+        cash_amount = float(evt.get("usdcSize") or 0) or float(evt.get("price") or 0) * float(evt.get("size") or 0)
+        size = float(evt.get("size") or 0)
+
+        if etype == "TRADE":
+            if bucket["first_trade_ts"] is None:
+                bucket["first_trade_ts"] = ts
             bucket["trade_count"] += 1
-        elif evt.get("type") == "TRADE":
-            bucket["trade_count"] += 1
-        elif evt.get("type") == "REDEEM":
-            bucket["redeem_payout"] += float(evt.get("usdcSize") or evt.get("size") or 0)
-            bucket["realized"] = True
+            if evt.get("side") == "BUY":
+                bucket["net_cash"] -= abs(cash_amount)
+                bucket["shares_by_asset"][asset] = bucket["shares_by_asset"].get(asset, 0.0) + size
+                if asset:
+                    bucket["assets_entered"].add(asset)
+            else:  # SELL
+                bucket["net_cash"] += abs(cash_amount)
+                bucket["shares_by_asset"][asset] = bucket["shares_by_asset"].get(asset, 0.0) - size
+        elif etype == "REDEEM":
+            bucket["net_cash"] += abs(cash_amount)
+            bucket["saw_redeem_or_merge"] = True
+            if asset:
+                bucket["shares_by_asset"][asset] = bucket["shares_by_asset"].get(asset, 0.0) - size
+        elif etype == "MERGE":
+            bucket["net_cash"] += abs(cash_amount)
+            bucket["saw_redeem_or_merge"] = True
+        elif etype == "SPLIT":
+            bucket["net_cash"] -= abs(cash_amount)
 
     rounds = []
     for cid, b in by_market.items():
-        pnl = b["redeem_payout"] - b["cost_basis"] if b["realized"] else None
-        avg_entry_price = (b["cost_basis"] / b["shares_bought"]) if b["shares_bought"] else None
+        assets_entered = sorted(b["assets_entered"])
+        side_taken = assets_entered[0] if len(assets_entered) == 1 else ("MIXED" if len(assets_entered) > 1 else None)
+
+        is_flat = all(abs(qty) < 1e-6 for qty in b["shares_by_asset"].values())
+        is_closed = b["saw_redeem_or_merge"] or is_flat or (cid not in open_condition_ids and open_condition_ids)
+
+        pnl = b["net_cash"] if is_closed else None
         rounds.append(
             {
                 "conditionId": cid,
                 "title": b["title"],
-                "side_taken": b["outcome"],
+                "is_5min_crypto_updown": bool(_FIVE_MIN_TITLE_RE.search(b["title"] or "")),
+                "side_taken": side_taken,
                 "first_trade_ts": b["first_trade_ts"],
                 "last_event_ts": b["last_event_ts"],
                 "trade_count": b["trade_count"],
-                "avg_entry_price": round(avg_entry_price, 4) if avg_entry_price is not None else None,
-                "cost_basis": round(b["cost_basis"], 4),
-                "redeem_payout": round(b["redeem_payout"], 4) if b["realized"] else None,
+                "net_cash_flow": round(b["net_cash"], 4),
+                "status": "CLOSED" if is_closed else "OPEN",
                 "realized_pnl": round(pnl, 4) if pnl is not None else None,
-                "result": (None if pnl is None else ("WIN" if pnl > 0 else "LOSS")),
+                "result": (
+                    None if pnl is None else ("WIN" if pnl > 0 else ("LOSS" if pnl < 0 else "BREAKEVEN"))
+                ),
             }
         )
 

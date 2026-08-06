@@ -67,16 +67,25 @@ def cmd_wallet(args: argparse.Namespace) -> None:
 
 def cmd_history(args: argparse.Namespace) -> None:
     client = PolymarketClient()
+    print(f"Fetching open positions for {args.address} ...", file=sys.stderr)
+    open_condition_ids = {p.get("conditionId") for p in client.positions(args.address) if p.get("conditionId")}
+
     print(f"Fetching {args.days}-day activity history for {args.address} (chunk_days={args.chunk_days}) ...", file=sys.stderr)
     activity = fetch_full_activity(client, args.address, days=args.days, chunk_days=args.chunk_days)
-    rounds = build_round_ledger(activity)
+    rounds = build_round_ledger(activity, open_condition_ids=open_condition_ids)
 
-    resolved = [r for r in rounds if r["result"] is not None]
-    wins = sum(1 for r in resolved if r["result"] == "WIN")
-    total_pnl = sum(r["realized_pnl"] for r in resolved if r["realized_pnl"] is not None)
+    closed = [r for r in rounds if r["status"] == "CLOSED"]
+    open_rounds = [r for r in rounds if r["status"] == "OPEN"]
+    wins = sum(1 for r in closed if r["result"] == "WIN")
+    losses = sum(1 for r in closed if r["result"] == "LOSS")
+    total_pnl = sum(r["realized_pnl"] for r in closed if r["realized_pnl"] is not None)
+    five_min_rounds = sum(1 for r in rounds if r["is_5min_crypto_updown"])
     print(
         f"{len(activity)} raw events -> {len(rounds)} markets traded "
-        f"({len(resolved)} resolved, {wins}/{len(resolved)} wins, net realized P&L ${total_pnl:.2f})",
+        f"({five_min_rounds} are 5-min crypto Up/Down markets) | "
+        f"{len(closed)} closed ({wins}W/{losses}L, win rate "
+        f"{(wins / (wins + losses) * 100) if (wins + losses) else 0:.1f}%, net realized P&L ${total_pnl:,.2f}) | "
+        f"{len(open_rounds)} still open",
         file=sys.stderr,
     )
 
@@ -85,7 +94,16 @@ def cmd_history(args: argparse.Namespace) -> None:
     export.write_csv(activity, f"{out_dir}/{args.address}_activity_{args.days}d.csv")
     export.write_json(rounds, f"{out_dir}/{args.address}_rounds_{args.days}d.json")
     export.write_csv(rounds, f"{out_dir}/{args.address}_rounds_{args.days}d.csv")
-    print(f"Wrote {out_dir}/{args.address}_activity_{args.days}d.csv and _rounds_{args.days}d.csv", file=sys.stderr)
+
+    five_min = [r for r in rounds if r["is_5min_crypto_updown"]]
+    export.write_json(five_min, f"{out_dir}/{args.address}_rounds_5min_only_{args.days}d.json")
+    export.write_csv(five_min, f"{out_dir}/{args.address}_rounds_5min_only_{args.days}d.csv")
+
+    print(
+        f"Wrote {out_dir}/{args.address}_activity_{args.days}d.csv, "
+        f"_rounds_{args.days}d.csv, and _rounds_5min_only_{args.days}d.csv ({len(five_min)} rows)",
+        file=sys.stderr,
+    )
 
 
 def cmd_extract(args: argparse.Namespace) -> None:
