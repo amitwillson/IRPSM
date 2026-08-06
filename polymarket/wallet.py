@@ -6,12 +6,16 @@ import logging
 import time
 from dataclasses import dataclass, field
 
-from .client import PolymarketClient
+from .client import PolymarketBadRequestError, PolymarketClient
 
 logger = logging.getLogger(__name__)
 
 DATA_API_ACTIVITY_PAGE_SIZE = 500
-DATA_API_MAX_OFFSET = 10000  # hard ceiling enforced by data-api.polymarket.com
+# Docs advertise offset up to 10000, but in practice the API has started
+# returning 400s well before that for some wallets (observed as low as
+# ~5500). We treat that as a real "no more pages" signal rather than an
+# error - see the PolymarketBadRequestError handling in fetch_full_activity.
+DATA_API_MAX_OFFSET = 10000
 
 
 @dataclass
@@ -142,55 +146,107 @@ def filter_positions_by_condition_ids(positions: list[dict], condition_ids: set[
     return [p for p in positions if p.get("conditionId") in condition_ids]
 
 
+def _fetch_activity_window(
+    client: PolymarketClient,
+    address: str,
+    start_ts: int,
+    end_ts: int,
+    event_types: str,
+) -> list[dict]:
+    """Offset-paginate a single [start_ts, end_ts) time window until exhausted or the offset ceiling hits."""
+    events: list[dict] = []
+    offset = 0
+
+    while True:
+        try:
+            page = client.activity(
+                address,
+                type=event_types,
+                start=start_ts,
+                end=end_ts,
+                limit=DATA_API_ACTIVITY_PAGE_SIZE,
+                offset=offset,
+                sortBy="TIMESTAMP",
+                sortDirection="DESC",
+            )
+        except PolymarketBadRequestError as exc:
+            if offset == 0:
+                raise  # first page failing is a real error (bad address, etc.)
+            logger.warning(
+                "%s: Data API rejected offset=%d within window [%d, %d) (%s); "
+                "that window's history is truncated at this point (still trading heavily "
+                "within a single %d-day chunk — narrow --chunk-days to fix).",
+                address,
+                offset,
+                start_ts,
+                end_ts,
+                exc,
+                (end_ts - start_ts) // 86400 or 1,
+            )
+            break
+
+        if not page:
+            break
+
+        events.extend(page)
+        if len(page) < DATA_API_ACTIVITY_PAGE_SIZE:
+            break  # last page in this window
+        offset += DATA_API_ACTIVITY_PAGE_SIZE
+        if offset > DATA_API_MAX_OFFSET:
+            logger.warning(
+                "%s: hit Data API offset ceiling (%d) within window [%d, %d); "
+                "that window's older history is unavailable",
+                address,
+                DATA_API_MAX_OFFSET,
+                start_ts,
+                end_ts,
+            )
+            break
+
+    return events
+
+
 def fetch_full_activity(
     client: PolymarketClient,
     address: str,
     days: int = 180,
     event_types: str = "TRADE,SPLIT,MERGE,REDEEM,REWARD,CONVERSION",
+    chunk_days: int = 7,
 ) -> list[dict]:
-    """Page through /activity to pull a wallet's complete history for the last `days` days.
+    """Pull a wallet's complete activity history for the last `days` days.
 
-    The Data API paginates with limit/offset (limit<=500, offset<=10000), and
-    returns events newest-first. We page until either a short page tells us
-    we've exhausted history, the offset ceiling is hit, or every event on a
-    page is already older than the cutoff.
+    The Data API's /activity offset pagination has a ceiling well below its
+    documented 10000 for very active wallets (observed 400s as low as
+    offset~5500 in practice) — a single unbounded pull can silently truncate
+    a heavy 5-min-market trader's history to a couple of weeks instead of 6
+    months. To avoid that, we split the requested range into `chunk_days`
+    windows (via the API's start/end filters) and offset-paginate each
+    window independently, so each individual pull only needs to cover a few
+    hundred to a few thousand events rather than the whole history at once.
     """
-    cutoff_ts = int(time.time()) - days * 86400
+    now = int(time.time())
+    cutoff_ts = now - days * 86400
+    chunk_seconds = chunk_days * 86400
+
     all_events: list[dict] = []
-    offset = 0
+    window_end = now
+    while window_end > cutoff_ts:
+        window_start = max(window_end - chunk_seconds, cutoff_ts)
+        all_events.extend(_fetch_activity_window(client, address, window_start, window_end, event_types))
+        window_end = window_start
 
-    while True:
-        page = client.activity(
-            address,
-            type=event_types,
-            limit=DATA_API_ACTIVITY_PAGE_SIZE,
-            offset=offset,
-            sortBy="TIMESTAMP",
-            sortDirection="DESC",
-        )
-        if not page:
-            break
+    # De-dupe in case of overlapping boundary events, then keep only the requested range.
+    seen: set[str] = set()
+    deduped = []
+    for e in all_events:
+        key = e.get("transactionHash", "") + str(e.get("timestamp")) + str(e.get("asset", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        if int(e.get("timestamp") or 0) >= cutoff_ts:
+            deduped.append(e)
 
-        all_events.extend(page)
-        oldest_ts_on_page = min(int(e.get("timestamp") or 0) for e in page)
-
-        if len(page) < DATA_API_ACTIVITY_PAGE_SIZE:
-            break  # last page
-        if oldest_ts_on_page < cutoff_ts:
-            break  # we've paged past the window we care about
-        offset += DATA_API_ACTIVITY_PAGE_SIZE
-        if offset > DATA_API_MAX_OFFSET:
-            logger.warning(
-                "%s: hit Data API offset ceiling (%d) before reaching %d days back; "
-                "history is truncated to the most recent ~%d events",
-                address,
-                DATA_API_MAX_OFFSET,
-                days,
-                offset,
-            )
-            break
-
-    return [e for e in all_events if int(e.get("timestamp") or 0) >= cutoff_ts]
+    return deduped
 
 
 def build_round_ledger(activity: list[dict]) -> list[dict]:

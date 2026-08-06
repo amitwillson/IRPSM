@@ -67,8 +67,8 @@ def cmd_wallet(args: argparse.Namespace) -> None:
 
 def cmd_history(args: argparse.Namespace) -> None:
     client = PolymarketClient()
-    print(f"Fetching {args.days}-day activity history for {args.address} ...", file=sys.stderr)
-    activity = fetch_full_activity(client, args.address, days=args.days)
+    print(f"Fetching {args.days}-day activity history for {args.address} (chunk_days={args.chunk_days}) ...", file=sys.stderr)
+    activity = fetch_full_activity(client, args.address, days=args.days, chunk_days=args.chunk_days)
     rounds = build_round_ledger(activity)
 
     resolved = [r for r in rounds if r["result"] is not None]
@@ -130,6 +130,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_hist.add_argument("address")
     p_hist.add_argument("--days", type=int, default=180, help="How many days back to pull (default 180 = 6 months)")
+    p_hist.add_argument(
+        "--chunk-days",
+        type=int,
+        default=7,
+        help="Time-window size per pagination chunk (default 7). Lower this (e.g. 1) for extremely "
+        "active wallets that might exceed ~5000 events within a single chunk.",
+    )
     p_hist.add_argument("--out", default="output", help="Output directory")
     p_hist.set_defaults(func=cmd_history)
 

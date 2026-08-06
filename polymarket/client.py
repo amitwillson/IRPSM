@@ -17,6 +17,15 @@ class PolymarketAPIError(RuntimeError):
     """Raised when a Polymarket API request fails after all retries."""
 
 
+class PolymarketBadRequestError(PolymarketAPIError):
+    """Raised immediately (no retry) on a 4xx other than 429.
+
+    These are permanent for the given request (bad params, an offset past
+    what the endpoint actually supports, etc.) — retrying with backoff just
+    wastes time reproducing the same error.
+    """
+
+
 class PolymarketClient:
     """Read-only client for the Gamma, Data and CLOB public APIs.
 
@@ -58,10 +67,16 @@ class PolymarketClient:
                     logger.warning("429 rate limited on %s, backing off %.1fs", url, wait)
                     time.sleep(wait)
                     continue
+                if 400 <= resp.status_code < 500:
+                    raise PolymarketBadRequestError(
+                        f"GET {url} -> {resp.status_code}: {resp.text[:300]}"
+                    )
                 resp.raise_for_status()
                 if self.request_delay:
                     time.sleep(self.request_delay)
                 return resp.json()
+            except PolymarketBadRequestError:
+                raise
             except requests.RequestException as exc:
                 last_exc = exc
                 wait = self.backoff_seconds * (2 ** (attempt - 1))
