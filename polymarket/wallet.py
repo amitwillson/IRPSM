@@ -12,11 +12,65 @@ from .client import PolymarketBadRequestError, PolymarketClient
 logger = logging.getLogger(__name__)
 
 DATA_API_ACTIVITY_PAGE_SIZE = 500
-# Docs advertise offset up to 10000, but in practice the API has started
-# returning 400s well before that for some wallets (observed as low as
-# ~5500). We treat that as a real "no more pages" signal rather than an
-# error - see the PolymarketBadRequestError handling in fetch_full_activity.
-DATA_API_MAX_OFFSET = 10000
+# Docs advertise offset up to 10000, but in practice the API enforces a much
+# lower ceiling for very active wallets - confirmed via a live 400 response:
+# {"error":"max historical activity offset of 5000 exceeded"}. We treat that
+# as a real "no more pages" signal rather than an error - see the
+# PolymarketBadRequestError handling in fetch_full_activity.
+DATA_API_MAX_OFFSET = 5000
+
+DATA_API_POSITIONS_PAGE_SIZE = 500
+
+
+def fetch_all_positions(client: PolymarketClient, address: str) -> list[dict]:
+    """Page through /positions to get *every* currently-open position, not just the first 500.
+
+    A wallet that has traded hundreds of markets can easily have more than
+    500 positions still open (including resolved-but-unredeemed winners) -
+    truncating this silently makes those winners look "closed with no
+    payout" downstream, which is indistinguishable from a loss.
+
+    /positions' offset support isn't as clearly documented as /activity's,
+    so this guards against two possible failure modes: an offset the API
+    rejects outright (400, handled like the activity ceiling), and an offset
+    the API silently ignores (which would otherwise re-return page 1 forever
+    - detected by comparing each page's leading asset id to the previous
+    page's and stopping on a repeat).
+    """
+    all_positions: list[dict] = []
+    offset = 0
+    prev_first_asset = None
+
+    while True:
+        try:
+            page = client.positions(address, limit=DATA_API_POSITIONS_PAGE_SIZE, offset=offset)
+        except PolymarketBadRequestError as exc:
+            if offset == 0:
+                raise
+            logger.warning("%s: /positions rejected offset=%d (%s); stopping there.", address, offset, exc)
+            break
+
+        if not page:
+            break
+
+        first_asset = page[0].get("asset")
+        if offset > 0 and first_asset == prev_first_asset:
+            logger.warning(
+                "%s: /positions offset=%d returned the same page as before; "
+                "the endpoint may not support pagination. Stopping at %d positions.",
+                address,
+                offset,
+                len(all_positions),
+            )
+            break
+        prev_first_asset = first_asset
+
+        all_positions.extend(page)
+        if len(page) < DATA_API_POSITIONS_PAGE_SIZE:
+            break
+        offset += DATA_API_POSITIONS_PAGE_SIZE
+
+    return all_positions
 
 
 @dataclass
@@ -99,7 +153,7 @@ def build_wallet_profile(
                 profile.leaderboard_rank = hit
                 break
 
-    positions = client.positions(address)
+    positions = fetch_all_positions(client, address)
     profile.positions = positions
     for pos in positions:
         profile.capital_deployed += float(pos.get("initialValue") or 0)

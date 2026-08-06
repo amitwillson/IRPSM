@@ -21,7 +21,7 @@ from polymarket.config import LEADERBOARD_CATEGORIES, LEADERBOARD_TIME_PERIODS
 from polymarket.leaderboard import fetch_leaderboard, fetch_leaderboard_all_periods
 from polymarket.markets import fetch_current_updown_markets, fetch_recent_updown_markets
 from polymarket.pipeline import run_full_extraction
-from polymarket.wallet import build_round_ledger, build_wallet_profile, fetch_full_activity
+from polymarket.wallet import build_round_ledger, build_wallet_profile, fetch_all_positions, fetch_full_activity
 
 
 def cmd_leaderboard(args: argparse.Namespace) -> None:
@@ -68,7 +68,9 @@ def cmd_wallet(args: argparse.Namespace) -> None:
 def cmd_history(args: argparse.Namespace) -> None:
     client = PolymarketClient()
     print(f"Fetching open positions for {args.address} ...", file=sys.stderr)
-    open_condition_ids = {p.get("conditionId") for p in client.positions(args.address) if p.get("conditionId")}
+    open_positions = fetch_all_positions(client, args.address)
+    open_condition_ids = {p.get("conditionId") for p in open_positions if p.get("conditionId")}
+    print(f"{len(open_positions)} currently-open positions found", file=sys.stderr)
 
     print(f"Fetching {args.days}-day activity history for {args.address} (chunk_days={args.chunk_days}) ...", file=sys.stderr)
     activity = fetch_full_activity(client, args.address, days=args.days, chunk_days=args.chunk_days)
