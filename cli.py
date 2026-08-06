@@ -21,7 +21,7 @@ from polymarket.config import LEADERBOARD_CATEGORIES, LEADERBOARD_TIME_PERIODS
 from polymarket.leaderboard import fetch_leaderboard, fetch_leaderboard_all_periods
 from polymarket.markets import fetch_current_updown_markets, fetch_recent_updown_markets
 from polymarket.pipeline import run_full_extraction
-from polymarket.wallet import build_wallet_profile
+from polymarket.wallet import build_round_ledger, build_wallet_profile, fetch_full_activity
 
 
 def cmd_leaderboard(args: argparse.Namespace) -> None:
@@ -65,6 +65,29 @@ def cmd_wallet(args: argparse.Namespace) -> None:
     print(json.dumps(result, indent=2, default=str))
 
 
+def cmd_history(args: argparse.Namespace) -> None:
+    client = PolymarketClient()
+    print(f"Fetching {args.days}-day activity history for {args.address} ...", file=sys.stderr)
+    activity = fetch_full_activity(client, args.address, days=args.days)
+    rounds = build_round_ledger(activity)
+
+    resolved = [r for r in rounds if r["result"] is not None]
+    wins = sum(1 for r in resolved if r["result"] == "WIN")
+    total_pnl = sum(r["realized_pnl"] for r in resolved if r["realized_pnl"] is not None)
+    print(
+        f"{len(activity)} raw events -> {len(rounds)} markets traded "
+        f"({len(resolved)} resolved, {wins}/{len(resolved)} wins, net realized P&L ${total_pnl:.2f})",
+        file=sys.stderr,
+    )
+
+    out_dir = args.out
+    export.write_json(activity, f"{out_dir}/{args.address}_activity_{args.days}d.json")
+    export.write_csv(activity, f"{out_dir}/{args.address}_activity_{args.days}d.csv")
+    export.write_json(rounds, f"{out_dir}/{args.address}_rounds_{args.days}d.json")
+    export.write_csv(rounds, f"{out_dir}/{args.address}_rounds_{args.days}d.csv")
+    print(f"Wrote {out_dir}/{args.address}_activity_{args.days}d.csv and _rounds_{args.days}d.csv", file=sys.stderr)
+
+
 def cmd_extract(args: argparse.Namespace) -> None:
     stats = run_full_extraction(
         out_dir=args.out,
@@ -101,6 +124,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_wal.add_argument("--with-leaderboard-rank", action="store_true")
     p_wal.add_argument("--out", help="Write JSON to this path")
     p_wal.set_defaults(func=cmd_wallet)
+
+    p_hist = sub.add_parser(
+        "history", help="Full N-day activity history + decoded round-by-round ledger for one wallet"
+    )
+    p_hist.add_argument("address")
+    p_hist.add_argument("--days", type=int, default=180, help="How many days back to pull (default 180 = 6 months)")
+    p_hist.add_argument("--out", default="output", help="Output directory")
+    p_hist.set_defaults(func=cmd_history)
 
     p_ex = sub.add_parser("extract", help="Full pipeline: leaderboard + markets + all wallet ledgers -> CSV/JSON")
     p_ex.add_argument("--out", default="output")
